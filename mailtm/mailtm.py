@@ -7,12 +7,18 @@ from .schemas.domains import Domains, Domain
 from .schemas.message import Messages, OneMessage, MessageSource
 from .utils.exceptions import MailTMInvalidResponse
 from .utils.misc import random_string, validate_response
-
+import json,os 
+from pathlib import Path
+import aiohttp
 logger = logging.getLogger('mailtm')
+
+class InvalidDbAccountException(Exception):
+    """Raised if an account could not be recovered from the db file."""
 
 
 class MailTM:
     API_URL = "https://api.mail.tm"
+    db_file = os.path.join(Path.home(), ".pymailtm")
 
     def __init__(self, session: ClientSession = None):
         self.session = session or ClientSession()
@@ -58,22 +64,50 @@ class MailTM:
         """
         https://docs.mail.tm/#post-accounts
         """
-        if address is None:
-            domain = (await self.get_domains()).hydra_member[0].domain
-            address = f"{random_string()}@{domain}"
-        if password is None:
-            password = random_string()
-        payload = {
+        async with aiohttp.ClientSession() as session:
+            if address is None:
+                domain = (await self.get_domains()).hydra_member[0].domain
+                address = f"{random_string()}@{domain}"
+            if password is None:
+                password = random_string()
+            payload = {
+                "address": address,
+                "password": password
+            }
+            logger.debug(f'Create account with payload: {payload}')
+            async with session.post(f"{self.API_URL}/accounts", json=payload) as response:
+                logger.debug(f'Response for {self.API_URL}/accounts: {response}')
+                if await validate_response(response):
+                    account_data = await response.json()
+                    account = Account(**account_data)
+                    
+                    # Save the account credentials
+                    self._save_account(account.id, account.address, password)
+                    
+                    return account
+                logger.debug(f'Error response for {self.API_URL}/accounts: {response}')
+                raise MailTMInvalidResponse
+    
+    def _save_account(self, account_id, address, password):
+        """Save the account credentials for later use."""
+        data = {
+            "account_id": account_id,
             "address": address,
             "password": password
-        }
-        logger.debug(f'Create account with payload: {payload}')
-        response = await self.session.post(f"{self.API_URL}/accounts", json=payload)
-        logger.debug(f'Response for {self.API_URL}/accounts: {response}')
-        if await validate_response(response):
-            return Account(**(await response.json()))
-        logger.debug(f'Error response for {self.API_URL}/accounts: {response}')
-        raise MailTMInvalidResponse
+            }
+        with open(self.db_file, "w+") as db:
+            json.dump(data, db)
+
+    def _load_account(self):
+        """Return the last used account."""
+        with open(self.db_file, "r") as db:
+            data = json.load(db)
+        # send a /me request to ensure the account is there
+        if "address" not in data or "password" not in data or "id" not in data:
+            # No valid db file was found, raise
+            raise InvalidDbAccountException()
+        else:
+            return Account(data["id"], data["address"], data["password"])            
 
     async def get_account_by_id(self, account_id, token) -> Account:
         """
